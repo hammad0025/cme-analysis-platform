@@ -192,6 +192,15 @@ class CMEAnalysisPlatformStack(Stack):
             ],
             resources=["*"]
         ))
+        
+        # Grant Comprehend access
+        lambda_role.add_to_policy(iam.PolicyStatement(
+            actions=[
+                "comprehend:DetectSentiment",
+                "comprehend:DetectEntities"
+            ],
+            resources=["*"]
+        ))
 
         # Main API Lambda
         api_lambda = lambda_.Function(
@@ -215,13 +224,28 @@ class CMEAnalysisPlatformStack(Stack):
             }
         )
 
+        # Transcription Waiter Lambda (for Step Functions)
+        transcription_waiter_lambda = lambda_.Function(
+            self, "TranscriptionWaiter",
+            function_name="cme-transcription-waiter",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            code=lambda_.Code.from_asset("../backend/lambda_functions"),
+            handler="transcription_waiter.handler",
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            role=lambda_role,
+            environment={
+                "CME_SESSIONS_TABLE": sessions_table.table_name
+            }
+        )
+        
         # NLP Processor Lambda
         nlp_lambda = lambda_.Function(
             self, "CMENLPProcessor",
             function_name="cme-nlp-processor",
             runtime=lambda_.Runtime.PYTHON_3_12,
             code=lambda_.Code.from_asset("../backend/lambda_functions"),
-            handler="cme_nlp_processor.process_transcript_for_cme_analysis",
+            handler="cme_nlp_processor.handler",
             timeout=Duration.minutes(5),
             memory_size=2048,
             role=lambda_role,
@@ -238,7 +262,7 @@ class CMEAnalysisPlatformStack(Stack):
             function_name="cme-video-processor",
             runtime=lambda_.Runtime.PYTHON_3_12,
             code=lambda_.Code.from_asset("../backend/lambda_functions"),
-            handler="cme_video_processor.process_video_for_cme_test",
+            handler="cme_video_processor.handler",
             timeout=Duration.minutes(15),
             memory_size=3008,
             ephemeral_storage_size=lambda_.Size.gibibytes(10),  # For video processing
@@ -332,10 +356,32 @@ class CMEAnalysisPlatformStack(Stack):
             )
         )
 
+        # ========== Step Functions Workflow ==========
+        from step_function_workflow import create_cme_processing_workflow
+        
+        state_machine = create_cme_processing_workflow(
+            self,
+            transcription_waiter_lambda,
+            nlp_lambda,
+            video_lambda,
+            report_lambda,
+            sessions_table.table_name
+        )
+        
+        # Grant Step Function permissions to invoke Lambdas
+        transcription_waiter_lambda.grant_invoke(state_machine)
+        nlp_lambda.grant_invoke(state_machine)
+        video_lambda.grant_invoke(state_machine)
+        report_lambda.grant_invoke(state_machine)
+        
+        # Grant Step Function DynamoDB access
+        sessions_table.grant_read_write_data(state_machine)
+        
         # ========== Outputs ==========
         self.api_url = api.url
         self.user_pool_id = user_pool.user_pool_id
         self.user_pool_client_id = user_pool_client.user_pool_client_id
         self.bucket_name = cme_bucket.bucket_name
+        self.state_machine_arn = state_machine.state_machine_arn
 
 

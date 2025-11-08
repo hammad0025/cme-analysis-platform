@@ -421,11 +421,19 @@ def process_video_for_cme_test(
     """
     Main processing function for video analysis of a declared test
     Combines video segmentation and action analysis
+    **NOW WITH PERSISTENCE AND REKOGNITION POLLING**
     """
+    import os
+    import boto3
+    
+    dynamodb = boto3.resource('dynamodb')
+    actions_table = dynamodb.Table(os.environ.get('CME_ACTIONS_TABLE', 'cme-observed-actions'))
+    
     processor = CMEVideoProcessor(s3_bucket)
     
     test_timestamp = float(declared_test.get('timestamp', 0))
     test_type = declared_test.get('label', 'unknown')
+    declared_step_id = declared_test.get('declared_step_id', '')
     
     # Step 5: Extract video segment
     segment_key = processor.extract_video_segment(
@@ -436,23 +444,199 @@ def process_video_for_cme_test(
     )
     
     if not segment_key:
+        logger.warning(f"Failed to extract segment, using simple analysis")
+        # Even without segment, record that we tried
+        action_id = f"action_{int(time.time())}"
+        action_item = {
+            'observed_action_id': action_id,
+            'declared_step_id': declared_step_id,
+            'motion_present': 'not_observed',
+            'pose_match': 'no_match',
+            'confidence_score': 0.0,
+            'analysis_details': {'error': 'Segment extraction failed'},
+            'created_at': int(time.time())
+        }
+        actions_table.put_item(Item=action_item)
+        
         return {
-            'error': 'Failed to extract video segment',
+            'session_id': session_id,
             'test_type': test_type,
-            'timestamp': test_timestamp
+            'timestamp': test_timestamp,
+            'error': 'Failed to extract video segment'
         }
     
     # Step 6: Analyze the segment
     analysis = processor.analyze_video_segment(segment_key, test_type)
+    
+    # Poll Rekognition jobs until complete
+    motion_job_id = analysis.get('motion_detected', {}).get('job_id')
+    pose_job_id = analysis.get('poses_detected', {}).get('job_id')
+    
+    # Simple polling (in production, use Step Function wait states)
+    import time as time_module
+    max_wait = 60  # Wait up to 60 seconds
+    waited = 0
+    
+    motion_result = None
+    pose_result = None
+    
+    while waited < max_wait:
+        if motion_job_id and not motion_result:
+            motion_result = processor.get_rekognition_results(motion_job_id, 'motion_analysis')
+            if motion_result.get('status') == 'COMPLETED':
+                logger.info(f"Motion analysis completed for {motion_job_id}")
+        
+        if pose_job_id and not pose_result:
+            pose_result = processor.get_rekognition_results(pose_job_id, 'pose_detection')
+            if pose_result.get('status') == 'COMPLETED':
+                logger.info(f"Pose detection completed for {pose_job_id}")
+        
+        if (motion_result and motion_result.get('status') == 'COMPLETED' and
+            pose_result and pose_result.get('status') == 'COMPLETED'):
+            break
+        
+        time_module.sleep(5)
+        waited += 5
+    
+    # Analyze Rekognition results
+    motion_present, pose_match, confidence = analyze_rekognition_results(
+        motion_result, pose_result, test_type
+    )
+    
+    # *** PERSIST OBSERVED ACTION TO DYNAMODB ***
+    action_id = f"action_{int(time.time())}"
+    action_item = {
+        'observed_action_id': action_id,
+        'declared_step_id': declared_step_id,
+        'motion_present': motion_present,
+        'pose_match': pose_match,
+        'confidence_score': confidence,
+        'analysis_details': {
+            'segment_key': segment_key,
+            'test_type': test_type,
+            'motion_job_id': motion_job_id,
+            'pose_job_id': pose_job_id,
+            'motion_labels': extract_motion_labels(motion_result),
+            'person_count': count_persons(pose_result)
+        },
+        'created_at': int(time.time())
+    }
+    
+    actions_table.put_item(Item=action_item)
+    logger.info(f"Persisted observed action: {action_id} - {motion_present}")
     
     return {
         'session_id': session_id,
         'test_type': test_type,
         'timestamp': test_timestamp,
         'segment_key': segment_key,
-        'analysis': analysis,
+        'action_id': action_id,
+        'motion_present': motion_present,
+        'pose_match': pose_match,
+        'confidence': confidence,
         'status': 'completed'
     }
+
+
+def analyze_rekognition_results(
+    motion_result: Dict[str, Any],
+    pose_result: Dict[str, Any],
+    test_type: str
+) -> tuple:
+    """
+    Actually analyze Rekognition results instead of returning placeholders
+    
+    Returns: (motion_present, pose_match, confidence)
+    """
+    motion_present = 'unknown'
+    pose_match = 'unknown'
+    confidence = 0.0
+    
+    # Check if results are available
+    if not motion_result or motion_result.get('status') != 'COMPLETED':
+        return ('not_observed', 'no_match', 0.0)
+    
+    if not pose_result or pose_result.get('status') != 'COMPLETED':
+        return ('not_observed', 'no_match', 0.0)
+    
+    # Extract labels from motion analysis
+    motion_labels = extract_motion_labels(motion_result)
+    person_count = count_persons(pose_result)
+    
+    # Analyze based on test type
+    expectations = TEST_MOTION_EXPECTATIONS.get(test_type, {})
+    expected_movements = expectations.get('expected_movements', [])
+    
+    # Check if any expected movement was detected
+    movements_found = []
+    for expected in expected_movements:
+        for label in motion_labels:
+            if expected.lower() in label.lower():
+                movements_found.append(expected)
+                break
+    
+    # Determine motion_present
+    if len(movements_found) >= len(expected_movements) * 0.7:  # 70% of movements found
+        motion_present = 'performed'
+        confidence = 0.8
+    elif len(movements_found) > 0:
+        motion_present = 'brief'
+        confidence = 0.5
+    else:
+        motion_present = 'not_observed'
+        confidence = 0.3
+    
+    # Determine pose_match
+    if person_count >= 2:  # Both examiner and patient present
+        if motion_present == 'performed':
+            pose_match = 'full_match'
+        elif motion_present == 'brief':
+            pose_match = 'partial'
+        else:
+            pose_match = 'no_match'
+    else:
+        pose_match = 'no_match'
+        confidence = min(confidence, 0.4)  # Lower confidence if not enough people
+    
+    return (motion_present, pose_match, confidence)
+
+
+def extract_motion_labels(motion_result: Dict[str, Any]) -> list:
+    """Extract relevant motion labels from Rekognition results"""
+    labels = []
+    
+    if not motion_result or 'results' not in motion_result:
+        return labels
+    
+    results = motion_result.get('results', {})
+    if 'Labels' in results:
+        for label_detection in results['Labels']:
+            label = label_detection.get('Label', {})
+            name = label.get('Name', '')
+            confidence = label.get('Confidence', 0)
+            
+            if confidence > 60:  # Only high-confidence labels
+                labels.append(name)
+    
+    return list(set(labels))  # Deduplicate
+
+
+def count_persons(pose_result: Dict[str, Any]) -> int:
+    """Count number of distinct persons detected"""
+    if not pose_result or 'results' not in pose_result:
+        return 0
+    
+    results = pose_result.get('results', {})
+    if 'Persons' in results:
+        person_ids = set()
+        for person_detection in results['Persons']:
+            person = person_detection.get('Person', {})
+            index = person.get('Index')
+            if index is not None:
+                person_ids.add(index)
+        return len(person_ids)
+    
+    return 0
 
 
 def generate_frame_snapshots(
@@ -509,4 +693,37 @@ def generate_frame_snapshots(
     except Exception as e:
         logger.error(f"Error generating frame snapshots: {str(e)}")
         return []
+
+
+def handler(event, context):
+    """
+    Lambda handler for Step Functions invocation
+    Processes a single declared test
+    """
+    try:
+        logger.info(f"Video Processor invoked: {json.dumps(event)}")
+        
+        session_id = event['session_id']
+        declared_test = event['declared_test']
+        video_s3_key = event['video_s3_key']
+        s3_bucket = os.environ.get('S3_BUCKET', 'default-bucket')
+        
+        # Process the test
+        result = process_video_for_cme_test(
+            session_id=session_id,
+            declared_test=declared_test,
+            video_s3_key=video_s3_key,
+            s3_bucket=s3_bucket
+        )
+        
+        return {
+            'statusCode': 200,
+            **result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in video processor handler: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise e
 

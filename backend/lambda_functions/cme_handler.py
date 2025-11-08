@@ -389,6 +389,7 @@ def handle_start_cme_processing(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     Trigger CME processing pipeline after recording upload
     This initiates Steps 3-8: Transcription, NLP, CV, Demeanor Analysis, Report
+    **NOW WITH STEP FUNCTION ORCHESTRATION**
     """
     try:
         session_id = body.get('session_id')
@@ -421,6 +422,29 @@ def handle_start_cme_processing(body: Dict[str, Any]) -> Dict[str, Any]:
         # Start Step 3: Speech-to-Text & Diarization
         transcription_job = start_transcription_job(session)
         
+        # *** START STEP FUNCTION WORKFLOW ***
+        step_functions_arn = os.environ.get('STEP_FUNCTION_ARN')
+        if step_functions_arn:
+            execution_input = {
+                'session_id': session_id,
+                'transcription_job_name': transcription_job.get('job_name'),
+                'video_s3_key': session.get('video_uri').replace('s3://', '').split('/', 1)[1] if session.get('video_uri').startswith('s3://') else session.get('video_uri')
+            }
+            
+            try:
+                execution_response = stepfunctions_client.start_execution(
+                    stateMachineArn=step_functions_arn,
+                    name=f"cme-{session_id}-{int(time.time())}",
+                    input=json.dumps(execution_input)
+                )
+                
+                execution_arn = execution_response['executionArn']
+                logger.info(f"Started Step Function execution: {execution_arn}")
+                
+            except Exception as sf_error:
+                logger.error(f"Failed to start Step Function: {str(sf_error)}")
+                # Continue anyway - transcription is running
+        
         logger.info(f"Started CME processing for session: {session_id}")
         
         return create_response(200, {
@@ -428,7 +452,7 @@ def handle_start_cme_processing(body: Dict[str, Any]) -> Dict[str, Any]:
             'status': 'processing',
             'stage': 'transcription',
             'transcription_job': transcription_job,
-            'message': 'CME analysis processing started',
+            'message': 'CME analysis processing started - full pipeline will run automatically',
             'estimated_time': 'Processing time depends on recording length (typically 5-15 minutes)'
         })
         

@@ -420,19 +420,82 @@ def process_transcript_for_cme_analysis(
     """
     Main processing function for CME transcript analysis
     Combines test intent detection and demeanor analysis
+    **NOW WITH DYNAMODB PERSISTENCE**
     """
+    import os
+    import boto3
+    
+    dynamodb = boto3.resource('dynamodb')
+    steps_table = dynamodb.Table(os.environ.get('CME_STEPS_TABLE', 'cme-declared-steps'))
+    demeanor_table = dynamodb.Table(os.environ.get('CME_DEMEANOR_TABLE', 'cme-demeanor-flags'))
+    sessions_table = dynamodb.Table(os.environ.get('CME_SESSIONS_TABLE', 'cme-sessions'))
+    
     processor = CMENLPProcessor()
     
     # Step 4: Detect declared tests
     declared_tests = processor.detect_declared_tests(transcript_data)
     
+    # *** PERSIST DECLARED TESTS TO DYNAMODB ***
+    persisted_step_ids = []
+    for test in declared_tests:
+        step_id = f"step_{int(time.time())}_{len(persisted_step_ids)}"
+        
+        step_item = {
+            'declared_step_id': step_id,
+            'session_id': session_id,
+            'timestamp': test.get('timestamp', 0),
+            'label': test.get('label', 'unknown'),
+            'transcript_text': test.get('matched_text', ''),
+            'confidence': test.get('confidence', 0.0),
+            'video_snippet_uri': '',
+            'created_at': int(time.time())
+        }
+        
+        steps_table.put_item(Item=step_item)
+        persisted_step_ids.append(step_id)
+        logger.info(f"Persisted declared step: {step_id} - {test.get('label')}")
+    
     # Step 7: Analyze demeanor
     demeanor_flags = processor.analyze_examiner_demeanor(transcript_data)
     
+    # *** PERSIST DEMEANOR FLAGS TO DYNAMODB ***
+    persisted_flag_ids = []
+    for flag in demeanor_flags:
+        flag_id = f"flag_{int(time.time())}_{len(persisted_flag_ids)}"
+        
+        flag_item = {
+            'flag_id': flag_id,
+            'session_id': session_id,
+            'timestamp': flag.get('timestamp', 0),
+            'flag_type': flag.get('flag_type', 'unknown'),
+            'transcript_excerpt': flag.get('transcript_excerpt', ''),
+            'severity': flag.get('severity', 'low'),
+            'description': flag.get('description', ''),
+            'created_at': int(time.time())
+        }
+        
+        demeanor_table.put_item(Item=flag_item)
+        persisted_flag_ids.append(flag_id)
+        logger.info(f"Persisted demeanor flag: {flag_id} - {flag.get('flag_type')}")
+    
+    # Update session status
+    sessions_table.update_item(
+        Key={'session_id': session_id},
+        UpdateExpression='SET processing_stage = :stage, updated_at = :updated',
+        ExpressionAttributeValues={
+            ':stage': 'video_analysis',
+            ':updated': int(time.time())
+        }
+    )
+    
+    logger.info(f"NLP Analysis complete: {len(declared_tests)} tests, {len(demeanor_flags)} flags")
+    
     return {
         'session_id': session_id,
-        'declared_tests': declared_tests,
+        'declared_tests': declared_tests,  # Return for Step Function to map over
         'demeanor_flags': demeanor_flags,
+        'persisted_step_ids': persisted_step_ids,
+        'persisted_flag_ids': persisted_flag_ids,
         'processing_timestamp': int(time.time()),
         'status': 'completed'
     }
@@ -480,4 +543,46 @@ Return ONLY a JSON array of test declarations, no additional text:
     except Exception as e:
         logger.error(f"Error in AI-enhanced test detection: {str(e)}")
         return []
+
+
+def handler(event, context):
+    """
+    Lambda handler for Step Functions invocation
+    """
+    try:
+        logger.info(f"NLP Processor invoked: {json.dumps(event)}")
+        
+        session_id = event['session_id']
+        transcript_data = event.get('transcript_data')
+        
+        # If transcript_data not provided, fetch from S3
+        if not transcript_data:
+            transcript_uri = event.get('transcript_uri')
+            if transcript_uri:
+                # Download transcript from S3
+                import boto3
+                s3_client = boto3.client('s3')
+                
+                if transcript_uri.startswith('s3://'):
+                    uri_parts = transcript_uri.replace('s3://', '').split('/', 1)
+                    bucket = uri_parts[0]
+                    key = uri_parts[1]
+                    
+                    response = s3_client.get_object(Bucket=bucket, Key=key)
+                    transcript_json = response['Body'].read().decode('utf-8')
+                    transcript_data = json.loads(transcript_json)
+        
+        # Process transcript
+        result = process_transcript_for_cme_analysis(session_id, transcript_data)
+        
+        return {
+            'statusCode': 200,
+            **result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in NLP processor handler: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise e
 
